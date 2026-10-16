@@ -147,6 +147,232 @@ def clean_payload(
     }
 
 
+# Keyword search helpers and incident search tool
+
+def sanitize_query_text(text: str) -> str:
+    """
+    Removes characters that could accidentally alter a
+    ServiceNow encoded query.
+    """
+
+    return (
+        text
+        .strip()
+        .replace("^", " ")
+        .replace("=", " ")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+
+def parse_keywords(keywords: str) -> list[str]:
+    """
+    Multiple keywords can be separated by commas.
+
+    Examples:
+
+    router down
+        -> ["router down"]
+
+    BGP, neighbor, flap
+        -> ["BGP", "neighbor", "flap"]
+    """
+
+    parts = [
+        sanitize_query_text(item)
+        for item in keywords.split(",")
+        if item.strip()
+    ]
+
+    # Remove duplicates while keeping original order
+    unique_parts = []
+
+    for item in parts:
+        if item and item.lower() not in [
+            existing.lower()
+            for existing in unique_parts
+        ]:
+            unique_parts.append(item)
+
+    return unique_parts
+
+
+def build_text_search_query(
+    base_conditions: list[str],
+    keywords: list[str],
+) -> str:
+    """
+    Builds a ServiceNow encoded query that searches
+    short_description OR description.
+
+    Multiple keywords are treated as OR searches.
+
+    Example:
+
+    keywords:
+        BGP, neighbor
+
+    Means approximately:
+
+        short_description contains BGP
+        OR description contains BGP
+        OR short_description contains neighbor
+        OR description contains neighbor
+    """
+
+    if not keywords:
+
+        query = "^".join(base_conditions)
+
+        if query:
+            query += "^"
+
+        return query + "ORDERBYDESCsys_updated_on"
+
+    branches = []
+
+    for keyword in keywords:
+
+        short_description_branch = (
+            base_conditions
+            + [
+                f"short_descriptionLIKE{keyword}"
+            ]
+        )
+
+        description_branch = (
+            base_conditions
+            + [
+                f"descriptionLIKE{keyword}"
+            ]
+        )
+
+        branches.append(
+            "^".join(short_description_branch)
+        )
+
+        branches.append(
+            "^".join(description_branch)
+        )
+
+    query = "^NQ".join(branches)
+
+    query += "^ORDERBYDESCsys_updated_on"
+
+    return query
+
+
+
+@mcp.tool()
+def search_incidents(
+    keywords: str,
+    days_back: int = 30,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """
+    Searches ServiceNow incidents by text found in either:
+
+    - short_description
+    - description
+
+    One word or phrase may be supplied:
+
+        router down
+
+    Multiple search terms may be separated by commas:
+
+        BGP, neighbor, flap
+
+    Multiple terms are treated as OR searches.
+
+    days_back filters by creation date. Results are sorted by latest update.
+
+    limit controls the maximum number of records returned.
+    """
+
+    if days_back < 0:
+        raise ValueError(
+            "days_back cannot be negative."
+        )
+
+    if limit < 1:
+        raise ValueError(
+            "limit must be at least 1."
+        )
+
+    limit = min(limit, 100)
+
+    parsed_keywords = parse_keywords(
+        keywords
+    )
+
+    if not parsed_keywords:
+        raise ValueError(
+            "At least one search keyword is required."
+        )
+
+    start_time = (
+        datetime.now(timezone.utc)
+        - timedelta(days=days_back)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    base_conditions = [
+        f"sys_created_on>={start_time}"
+    ]
+
+    query = build_text_search_query(
+        base_conditions,
+        parsed_keywords,
+    )
+
+    response = servicenow_request(
+        "GET",
+        "/api/now/table/incident",
+        params={
+            "sysparm_query":
+                query,
+            "sysparm_limit":
+                str(limit),
+            "sysparm_fields": (
+                "sys_id,"
+                "number,"
+                "short_description,"
+                "description,"
+                "state,"
+                "priority,"
+                "impact,"
+                "urgency,"
+                "caller_id,"
+                "assigned_to,"
+                "assignment_group,"
+                "opened_at,"
+                "sys_created_on,"
+                "sys_updated_on"
+            ),
+            "sysparm_display_value":
+                "true",
+        },
+    )
+
+    incidents = response.get(
+        "result",
+        [],
+    )
+
+    return {
+        "keywords":
+            parsed_keywords,
+        "days_back":
+            days_back,
+        "count":
+            len(incidents),
+        "incidents":
+            incidents,
+    }
+
+
+
+
 # =========================================================
 # 5. SERVICENOW CHOICE HELPERS
 # =========================================================
@@ -1169,122 +1395,64 @@ def update_change(
 
 @mcp.tool()
 def search_changes(
-    configuration_item: str,
+    configuration_item: str | None = None,
     days_back: int = 7,
     keyword: str | None = None,
     limit: int = 20,
+    keywords: str | None = None,
 ) -> dict[str, Any]:
+    """Search changes by text in short_description or description.
+
+    configuration_item is optional (CI name or sys_id).
+    keywords accepts a phrase such as 'router down', or comma-separated
+    terms such as 'BGP, neighbor, flap'. Any term may match either field.
+    keyword is a legacy alias; supply only one of keyword and keywords.
+    days_back filters by creation date (default 7 days); results are sorted
+    by most recently updated. limit is capped at 100.
+    Supply keywords, a configuration_item, or both.
     """
-    Searches ServiceNow Change Requests for a Configuration Item.
-
-    configuration_item is required and may be a CI name or sys_id.
-
-    days_back:
-        How many days back to search.
-        Default = 7.
-
-    keyword:
-        Optional text search against the short description
-        and description.
-
-    limit:
-        Maximum number of Change Requests returned.
-    """
-
     if days_back < 0:
-        raise ValueError(
-            "days_back cannot be negative."
-        )
-
+        raise ValueError("days_back cannot be negative.")
     if limit < 1:
-        raise ValueError(
-            "limit must be at least 1."
-        )
-
+        raise ValueError("limit must be at least 1.")
     limit = min(limit, 100)
-
-    ci = resolve_ci(
-        configuration_item
-    )
-
-    ci_sys_id = ci["sys_id"]
-
-    start_time = (
-        datetime.now(timezone.utc)
-        - timedelta(days=days_back)
-    ).strftime("%Y-%m-%d %H:%M:%S")
-
-    query = (
-        f"cmdb_ci={ci_sys_id}"
-        f"^sys_created_on>={start_time}"
-    )
-
-    if keyword:
-
-        safe_keyword = (
-            keyword
-            .replace("^", "")
-            .replace("=", "")
-        )
-
-        query += (
-            f"^short_descriptionLIKE{safe_keyword}"
-            f"^ORdescriptionLIKE{safe_keyword}"
-        )
-
-    query += "^ORDERBYDESCsys_created_on"
-
+    if keyword is not None and keywords is not None:
+        raise ValueError("Supply only keywords or keyword, not both.")
+    text = keywords if keywords is not None else keyword
+    parsed_keywords = parse_keywords(text or "")
+    if text is not None and not parsed_keywords:
+        raise ValueError("At least one search keyword is required when supplying keywords.")
+    configuration_item = (configuration_item or "").strip()
+    if not configuration_item and not parsed_keywords:
+        raise ValueError("Supply keywords or a configuration_item.")
+    start_time = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M:%S")
+    base_conditions = [f"sys_created_on>={start_time}"]
+    ci = None
+    if configuration_item:
+        ci = resolve_ci(configuration_item)
+        base_conditions.append(f"cmdb_ci={ci['sys_id']}")
+    query = build_text_search_query(base_conditions, parsed_keywords)
     response = servicenow_request(
-        "GET",
-        "/api/now/table/change_request",
+        "GET", "/api/now/table/change_request",
         params={
-            "sysparm_query":
-                query,
-            "sysparm_limit":
-                str(limit),
+            "sysparm_query": query,
+            "sysparm_limit": str(limit),
             "sysparm_fields": (
-                "sys_id,"
-                "number,"
-                "short_description,"
-                "state,"
-                "type,"
-                "risk,"
-                "impact,"
-                "priority,"
-                "cmdb_ci,"
-                "requested_by,"
-                "assigned_to,"
-                "assignment_group,"
-                "start_date,"
-                "end_date,"
-                "sys_created_on,"
-                "sys_updated_on"
+                "sys_id,number,short_description,description,state,type,risk,impact,"
+                "priority,cmdb_ci,requested_by,assigned_to,assignment_group,"
+                "start_date,end_date,sys_created_on,sys_updated_on"
             ),
-            "sysparm_display_value":
-                "true",
+            "sysparm_display_value": "true",
         },
     )
-
-    changes = response.get(
-        "result",
-        [],
-    )
-
+    changes = response.get("result", [])
     return {
-        "configuration_item": {
-            "name":
-                ci.get("name"),
-            "sys_id":
-                ci_sys_id,
-        },
-        "days_back":
-            days_back,
-        "keyword":
-            keyword,
-        "count":
-            len(changes),
-        "changes":
-            changes,
+        "configuration_item": {"name": ci.get("name"), "sys_id": ci["sys_id"]} if ci else None,
+        "keyword": text,
+        "keywords": parsed_keywords,
+        "days_back": days_back,
+        "count": len(changes),
+        "changes": changes,
     }
 
 

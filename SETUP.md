@@ -1,6 +1,6 @@
 # ServiceNow MCP on Render
 
-The complete server.py preserves all 10 tools and uses the official Python MCP SDK 1.26.0. Install the included requirements together with this file. Your original server has not been overwritten.
+The complete server.py includes 11 tools and uses the official Python MCP SDK 1.26.0. Install the included requirements together with this file. Your original server has not been overwritten.
 
 ## 1. Upload the files to GitHub
 
@@ -72,7 +72,7 @@ Then configure the MCP server:
 
 This is shared-token authentication for your POC, not an OAuth login flow. ServiceNow credentials stay in Render.
 
-Connect and discover the 10 tools: test_servicenow_connection, get_incident, create_incident, update_incident, close_incident, get_change, create_change, update_change, search_changes, close_change.
+Connect and discover the 11 tools: test_servicenow_connection, get_incident, search_incidents, create_incident, update_incident, close_incident, get_change, create_change, update_change, search_changes, close_change.
 
 First run test_servicenow_connection without arguments. Then run get_incident with an existing incident_number. Test writes on a disposable test record after reads succeed.
 
@@ -88,7 +88,7 @@ First run test_servicenow_connection without arguments. Then run get_incident wi
 
 ## Checks completed
 
-All original functions were compared and preserved. Local tests passed for health, rejecting missing/incorrect tokens, MCP initialization, discovery of all 10 tools, host/origin protection, and a simulated ServiceNow tool call. Live Render and ServiceNow integration still need to be tested.
+The original deployment passed HTTP authentication and discovery tests. This search update passed syntax and isolated function tests with simulated REST responses, including date/CI filtering, keyword parsing, limits and legacy calls. Existing functions other than search_changes, including the authentication and health code, were verified unchanged. HTTP integration could not be rerun because the local dependency folder was inaccessible. Live Render and ServiceNow searches still need testing.
 
 ## Sources
 
@@ -97,3 +97,14 @@ All original functions were compared and preserved. Local tests passed for healt
 - https://render.com/docs/environment-variables
 - https://render.com/docs/python-version
 - https://github.com/modelcontextprotocol/python-sdk/tree/v1.26.0
+
+
+## Updating an existing deployment with keyword search
+
+Replace server.py in your existing GitHub repository with this complete file and commit it. Dependencies and environment variables are unchanged. Let Render redeploy, or use Manual Deploy > Deploy latest commit. Reconnect/refresh tools in NetBrain; there are now 11 tools.
+
+- search_incidents(keywords="router down", days_back=30, limit=20)
+- search_changes(keywords="BGP, neighbor, flap", days_back=30, limit=20)
+- search_changes(configuration_item="router1", keywords="BGP", days_back=7)
+
+A phrase matches as a phrase. Comma-separated terms match ANY term in either short_description or description. Date filters apply to record creation time; results are sorted by most recent update. Incident searches default to 30 days; change searches retain the existing 7-day default. Limits are capped at 100. For changes, supply keywords, a configuration item, or both. The old singular keyword argument remains supported; do not supply both keyword and keywords.
